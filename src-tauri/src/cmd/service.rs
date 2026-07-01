@@ -1,27 +1,11 @@
-use super::CmdResult;
-use crate::{
-    core::{
-        CoreManager,
-        service::{self, SERVICE_MANAGER, ServiceStatus},
-    },
-    utils::i18n::t,
-};
+use super::{CmdResult, StringifyErr as _};
+use crate::core::service::{self, SERVICE_MANAGER, ServiceStatus};
 
 async fn execute_service_operation_sync(status: ServiceStatus, op_type: &str) -> CmdResult {
-    if let Err(e) = SERVICE_MANAGER
-        .lock()
+    SERVICE_MANAGER
+        .handle_service_status(status)
         .await
-        .handle_service_status(&status)
-        .await
-    {
-        let emsg = format!("{} Service failed: {}", op_type, e);
-        return Err(t(emsg.as_str()).await);
-    }
-    if CoreManager::global().restart_core().await.is_err() {
-        let emsg = "Restart Core failed";
-        return Err(t(emsg).await);
-    }
-    Ok(())
+        .map_err(|e| format!("{op_type} Service failed: {e}").into())
 }
 
 #[tauri::command]
@@ -46,8 +30,6 @@ pub async fn repair_service() -> CmdResult {
 
 #[tauri::command]
 pub async fn is_service_available() -> CmdResult<bool> {
-    service::is_service_available()
-        .await
-        .map(|_| true)
-        .map_err(|e| e.to_string())
+    service::is_service_available().await.stringify_err()?;
+    Ok(true)
 }

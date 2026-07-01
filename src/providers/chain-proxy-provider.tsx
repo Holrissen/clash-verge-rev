@@ -1,48 +1,32 @@
-import React, { createContext, useCallback, useContext, useState } from "react";
+import React, { useCallback, useMemo, useState } from 'react'
 
-interface ChainProxyContextType {
-  isChainMode: boolean;
-  setChainMode: (isChain: boolean) => void;
-  chainConfigData: string | null;
-  setChainConfigData: (data: string | null) => void;
-}
-
-const ChainProxyContext = createContext<ChainProxyContextType | null>(null);
+import { ChainProxyContext } from './chain-proxy-context'
 
 export const ChainProxyProvider = ({
   children,
 }: {
-  children: React.ReactNode;
+  children: React.ReactNode
 }) => {
-  const [isChainMode, setIsChainMode] = useState(false);
-  const [chainConfigData, setChainConfigData] = useState<string | null>(null);
+  const [isChainMode, setIsChainMode] = useState(false)
+  const [chainConfigData, setChainConfigData] = useState<string | null>(null)
 
   const setChainMode = useCallback((isChain: boolean) => {
-    setIsChainMode(isChain);
-  }, []);
+    setIsChainMode(isChain)
+  }, [])
 
   const setChainConfigDataCallback = useCallback((data: string | null) => {
-    setChainConfigData(data);
-  }, []);
+    setChainConfigData(data)
+  }, [])
 
-  return (
-    <ChainProxyContext.Provider
-      value={{
-        isChainMode,
-        setChainMode,
-        chainConfigData,
-        setChainConfigData: setChainConfigDataCallback,
-      }}
-    >
-      {children}
-    </ChainProxyContext.Provider>
-  );
-};
+  const contextValue = useMemo(
+    () => ({
+      isChainMode,
+      setChainMode,
+      chainConfigData,
+      setChainConfigData: setChainConfigDataCallback,
+    }),
+    [isChainMode, setChainMode, chainConfigData, setChainConfigDataCallback],
+  )
 
-export const useChainProxy = () => {
-  const context = useContext(ChainProxyContext);
-  if (!context) {
-    throw new Error("useChainProxy must be used within a ChainProxyProvider");
-  }
-  return context;
-};
+  return <ChainProxyContext value={contextValue}>{children}</ChainProxyContext>
+}

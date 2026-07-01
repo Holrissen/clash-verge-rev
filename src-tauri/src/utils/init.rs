@@ -1,60 +1,43 @@
-cfg_if::cfg_if! {
-    if #[cfg(not(feature = "tauri-dev"))] {
-        use crate::utils::logging::{console_colored_format, file_format, NoExternModule};
-        use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, LogSpecification, Logger};
-    }
-}
-
+// #[cfg(not(feature = "tracing"))]
 use crate::{
-    config::*,
+    config::{Config, IClashTemp, IProfiles, IVerge},
+    constants,
     core::handle,
     logging,
     process::AsyncHandler,
-    utils::{dirs, help, logging::Type},
+    utils::{
+        dirs::{self, PathBufExec as _},
+        help,
+    },
 };
 use anyhow::Result;
-use chrono::{Local, TimeZone};
-use std::{path::PathBuf, str::FromStr};
-use tauri_plugin_shell::ShellExt;
+use chrono::{Local, TimeZone as _};
+use clash_verge_logging::Type;
+#[cfg(target_os = "windows")]
+use std::path::Path;
+use std::{path::PathBuf, str::FromStr as _};
+use tauri_plugin_shell::ShellExt as _;
 use tokio::fs;
 use tokio::fs::DirEntry;
 
-/// initialize this instance's log file
-#[cfg(not(feature = "tauri-dev"))]
-pub async fn init_logger() -> Result<()> {
-    // TODO 提供 runtime 级别实时修改
-    let (log_level, log_max_size, log_max_count) = {
-        let verge_guard = Config::verge().await;
-        let verge = verge_guard.latest_ref();
-        (
-            verge.get_log_level(),
-            verge.app_log_max_size.unwrap_or(128),
-            verge.app_log_max_count.unwrap_or(8),
-        )
-    };
+#[cfg(target_os = "windows")]
+async fn delete_snapshot_logs(log_dir: &Path) -> Result<()> {
+    let temp_dirs = [
+        log_dir.join("temp"),
+        log_dir.join("service").join("temp"),
+        log_dir.join("sidecar").join("temp"),
+    ];
 
-    let log_dir = dirs::app_logs_dir()?;
-    let logger = Logger::with(LogSpecification::from(log_level))
-        .log_to_file(FileSpec::default().directory(log_dir).basename(""))
-        .duplicate_to_stdout(Duplicate::Debug)
-        .format(console_colored_format)
-        .format_for_files(file_format)
-        .rotate(
-            Criterion::Size(log_max_size * 1024),
-            flexi_logger::Naming::TimestampsCustomFormat {
-                current_infix: Some("latest"),
-                format: "%Y-%m-%d_%H-%M-%S",
-            },
-            Cleanup::KeepLogFiles(log_max_count),
-        )
-        .filter(Box::new(NoExternModule));
-
-    let _handle = logger.start()?;
-
-    // TODO 全局 logger handle 控制
-    // GlobalLoggerProxy::global().set_inner(handle);
-    // TODO 提供前端设置等级，热更新等级
-    // logger.parse_new_spec(spec)
+    for temp_dir in temp_dirs.iter().filter(|d| d.exists()) {
+        let mut entries = fs::read_dir(temp_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("log") {
+                let _ = path.remove_if_exists().await;
+                logging!(info, Type::Setup, "delete snapshot log file: {}", path.display());
+            }
+        }
+    }
 
     Ok(())
 }
@@ -67,9 +50,12 @@ pub async fn delete_log() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(target_os = "windows")]
+    delete_snapshot_logs(&log_dir).await?;
+
     let auto_log_clean = {
         let verge = Config::verge().await;
-        let verge = verge.latest_ref();
+        let verge = verge.data_arc();
         verge.auto_log_clean.unwrap_or(0)
     };
 
@@ -82,13 +68,7 @@ pub async fn delete_log() -> Result<()> {
         _ => return Ok(()),
     };
 
-    logging!(
-        info,
-        Type::Setup,
-        true,
-        "try to delete log files, day: {}",
-        day
-    );
+    logging!(info, Type::Setup, "try to delete log files, day: {}", day);
 
     // %Y-%m-%d to NaiveDateTime
     let parse_time_str = |s: &str| {
@@ -101,9 +81,9 @@ pub async fn delete_log() -> Result<()> {
         let month = u32::from_str(sa[1])?;
         let day = u32::from_str(sa[2])?;
         let time = chrono::NaiveDate::from_ymd_opt(year, month, day)
-            .ok_or(anyhow::anyhow!("invalid time str"))?
+            .ok_or_else(|| anyhow::anyhow!("invalid time str"))?
             .and_hms_opt(0, 0, 0)
-            .ok_or(anyhow::anyhow!("invalid time str"))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid time str"))?;
         Ok(time)
     };
 
@@ -117,13 +97,12 @@ pub async fn delete_log() -> Result<()> {
             let file_time = Local
                 .from_local_datetime(&created_time)
                 .single()
-                .ok_or(anyhow::anyhow!("invalid local datetime"))?;
+                .ok_or_else(|| anyhow::anyhow!("invalid local datetime"))?;
 
             let duration = now.signed_duration_since(file_time);
             if duration.num_days() > day {
-                let file_path = file.path();
-                let _ = fs::remove_file(file_path).await;
-                logging!(info, Type::Setup, true, "delete log file: {}", file_name);
+                let _ = file.path().remove_if_exists().await;
+                logging!(info, Type::Setup, "delete log file: {}", file_name);
             }
         }
         Ok(())
@@ -144,7 +123,7 @@ pub async fn delete_log() -> Result<()> {
 }
 
 /// 初始化DNS配置文件
-async fn init_dns_config() -> Result<()> {
+pub(super) async fn init_dns_config() -> Result<()> {
     use serde_yaml_ng::Value;
 
     // 创建DNS子配置
@@ -152,14 +131,9 @@ async fn init_dns_config() -> Result<()> {
         ("enable".into(), Value::Bool(true)),
         ("listen".into(), Value::String(":53".into())),
         ("enhanced-mode".into(), Value::String("fake-ip".into())),
-        (
-            "fake-ip-range".into(),
-            Value::String("198.18.0.1/16".into()),
-        ),
-        (
-            "fake-ip-filter-mode".into(),
-            Value::String("blacklist".into()),
-        ),
+        ("fake-ip-range".into(), Value::String("198.18.0.1/16".into())),
+        ("fake-ip-range6".into(), Value::String("fdfe:dcba:9876::1/64".into())),
+        ("fake-ip-filter-mode".into(), Value::String("blacklist".into())),
         ("prefer-h3".into(), Value::Bool(false)),
         ("respect-rules".into(), Value::Bool(false)),
         ("use-hosts".into(), Value::Bool(false)),
@@ -239,24 +213,16 @@ async fn init_dns_config() -> Result<()> {
     // 获取默认DNS和host配置
     let default_dns_config = serde_yaml_ng::Mapping::from_iter([
         ("dns".into(), Value::Mapping(dns_config)),
-        (
-            "hosts".into(),
-            Value::Mapping(serde_yaml_ng::Mapping::new()),
-        ),
+        ("hosts".into(), Value::Mapping(serde_yaml_ng::Mapping::new())),
     ]);
 
     // 检查DNS配置文件是否存在
     let app_dir = dirs::app_home_dir()?;
-    let dns_path = app_dir.join("dns_config.yaml");
+    let dns_path = app_dir.join(constants::files::DNS_CONFIG);
 
     if !dns_path.exists() {
-        logging!(info, Type::Setup, true, "Creating default DNS config file");
-        help::save_yaml(
-            &dns_path,
-            &default_dns_config,
-            Some("# Clash Verge DNS Config"),
-        )
-        .await?;
+        logging!(info, Type::Setup, "Creating default DNS config file");
+        help::save_yaml(&dns_path, &default_dns_config, Some("# Clash Verge DNS Config")).await?;
     }
 
     Ok(())
@@ -272,17 +238,10 @@ async fn ensure_directories() -> Result<()> {
 
     for (name, dir) in directories {
         if !dir.exists() {
-            fs::create_dir_all(&dir).await.map_err(|e| {
-                anyhow::anyhow!("Failed to create {} directory {:?}: {}", name, dir, e)
-            })?;
-            logging!(
-                info,
-                Type::Setup,
-                true,
-                "Created {} directory: {:?}",
-                name,
-                dir
-            );
+            fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create {} directory {:?}: {}", name, dir, e))?;
+            logging!(info, Type::Setup, "Created {} directory: {:?}", name, dir);
         }
     }
 
@@ -298,13 +257,7 @@ async fn initialize_config_files() -> Result<()> {
         help::save_yaml(&path, &template, Some("# Clash Verge"))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create clash config: {}", e))?;
-        logging!(
-            info,
-            Type::Setup,
-            true,
-            "Created clash config at {:?}",
-            path
-        );
+        logging!(info, Type::Setup, "Created clash config at {:?}", path);
     }
 
     if let Ok(path) = dirs::verge_path()
@@ -314,29 +267,17 @@ async fn initialize_config_files() -> Result<()> {
         help::save_yaml(&path, &template, Some("# Clash Verge"))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create verge config: {}", e))?;
-        logging!(
-            info,
-            Type::Setup,
-            true,
-            "Created verge config at {:?}",
-            path
-        );
+        logging!(info, Type::Setup, "Created verge config at {:?}", path);
     }
 
     if let Ok(path) = dirs::profiles_path()
         && !path.exists()
     {
-        let template = IProfiles::template();
+        let template = IProfiles::default();
         help::save_yaml(&path, &template, Some("# Clash Verge"))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create profiles config: {}", e))?;
-        logging!(
-            info,
-            Type::Setup,
-            true,
-            "Created profiles config at {:?}",
-            path
-        );
+        logging!(info, Type::Setup, "Created profiles config at {:?}", path);
     }
 
     // 验证并修正verge配置
@@ -354,9 +295,6 @@ pub async fn init_config() -> Result<()> {
     // let _ = dirs::init_portable_flag();
 
     // We do not need init_log here anymore due to resolve will to the things
-    // if let Err(e) = init_log().await {
-    //     eprintln!("Failed to initialize logging: {}", e);
-    // }
 
     ensure_directories().await?;
 
@@ -364,20 +302,10 @@ pub async fn init_config() -> Result<()> {
 
     AsyncHandler::spawn(|| async {
         if let Err(e) = delete_log().await {
-            logging!(warn, Type::Setup, true, "Failed to clean old logs: {}", e);
+            logging!(warn, Type::Setup, "Failed to clean old logs: {}", e);
         }
-        logging!(info, Type::Setup, true, "后台日志清理任务完成");
+        logging!(info, Type::Setup, "后台日志清理任务完成");
     });
-
-    if let Err(e) = init_dns_config().await {
-        logging!(
-            warn,
-            Type::Setup,
-            true,
-            "DNS config initialization failed: {}",
-            e
-        );
-    }
 
     Ok(())
 }
@@ -403,27 +331,8 @@ pub async fn init_resources() -> Result<()> {
         let src_path = res_dir.join(file);
         let dest_path = app_dir.join(file);
 
-        let handle_copy = |src: PathBuf, dest: PathBuf, file: String| async move {
-            match fs::copy(&src, &dest).await {
-                Ok(_) => {
-                    logging!(debug, Type::Setup, true, "resources copied '{}'", file);
-                }
-                Err(err) => {
-                    logging!(
-                        error,
-                        Type::Setup,
-                        true,
-                        "failed to copy resources '{}' to '{:?}', {}",
-                        file,
-                        dest,
-                        err
-                    );
-                }
-            };
-        };
-
         if src_path.exists() && !dest_path.exists() {
-            handle_copy(src_path.clone(), dest_path.clone(), file.to_string()).await;
+            handle_copy(&src_path, &dest_path, file).await;
             continue;
         }
 
@@ -433,18 +342,12 @@ pub async fn init_resources() -> Result<()> {
         match (src_modified, dest_modified) {
             (Ok(src_modified), Ok(dest_modified)) => {
                 if src_modified > dest_modified {
-                    handle_copy(src_path.clone(), dest_path.clone(), file.to_string()).await;
+                    handle_copy(&src_path, &dest_path, file).await;
                 }
             }
             _ => {
-                logging!(
-                    debug,
-                    Type::Setup,
-                    true,
-                    "failed to get modified '{}'",
-                    file
-                );
-                handle_copy(src_path.clone(), dest_path.clone(), file.to_string()).await;
+                logging!(debug, Type::Setup, "failed to get modified '{}'", file);
+                handle_copy(&src_path, &dest_path, file).await;
             }
         };
     }
@@ -456,7 +359,7 @@ pub async fn init_resources() -> Result<()> {
 #[cfg(target_os = "windows")]
 pub fn init_scheme() -> Result<()> {
     use tauri::utils::platform::current_exe;
-    use winreg::{RegKey, enums::*};
+    use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 
     let app_exe = current_exe()?;
     let app_exe = dunce::canonicalize(app_exe)?;
@@ -475,38 +378,40 @@ pub fn init_scheme() -> Result<()> {
 }
 #[cfg(target_os = "linux")]
 pub fn init_scheme() -> Result<()> {
-    let output = std::process::Command::new("xdg-mime")
-        .arg("default")
-        .arg("clash-verge.desktop")
-        .arg("x-scheme-handler/clash")
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "failed to set clash scheme, {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    const DESKTOP_FILE: &str = "clash-verge.desktop";
+
+    for scheme in DEEP_LINK_SCHEMES {
+        let handler = format!("x-scheme-handler/{scheme}");
+        let output = std::process::Command::new("xdg-mime")
+            .arg("default")
+            .arg(DESKTOP_FILE)
+            .arg(&handler)
+            .output()?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to set {handler}, {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
     }
+
+    crate::utils::linux::mime::ensure_mimeapps_entries(DESKTOP_FILE, DEEP_LINK_SCHEMES)?;
     Ok(())
 }
 #[cfg(target_os = "macos")]
-pub fn init_scheme() -> Result<()> {
+pub const fn init_scheme() -> Result<()> {
     Ok(())
 }
 
-pub async fn startup_script() -> Result<()> {
-    let app_handle = match handle::Handle::global().app_handle() {
-        Some(handle) => handle,
-        None => {
-            return Err(anyhow::anyhow!(
-                "app_handle not available for startup script execution"
-            ));
-        }
-    };
+#[cfg(target_os = "linux")]
+const DEEP_LINK_SCHEMES: &[&str] = &["clash", "clash-verge"];
 
+pub async fn startup_script() -> Result<()> {
+    let app_handle = handle::Handle::app_handle();
     let script_path = {
         let verge = Config::verge().await;
-        let verge = verge.latest_ref();
-        verge.startup_script.clone().unwrap_or("".to_string())
+        let verge = verge.data_arc();
+        verge.startup_script.clone().unwrap_or_else(|| "".into())
     };
 
     if script_path.is_empty() {
@@ -518,27 +423,42 @@ pub async fn startup_script() -> Result<()> {
     } else if script_path.ends_with(".ps1") || script_path.ends_with(".bat") {
         "powershell"
     } else {
-        return Err(anyhow::anyhow!(
-            "unsupported script extension: {}",
-            script_path
-        ));
+        return Err(anyhow::anyhow!("unsupported script extension: {}", script_path));
     };
 
-    let script_dir = PathBuf::from(&script_path);
+    let script_dir = PathBuf::from(script_path.as_str());
     if !script_dir.exists() {
         return Err(anyhow::anyhow!("script not found: {}", script_path));
     }
 
     let parent_dir = script_dir.parent();
-    let working_dir = parent_dir.unwrap_or(script_dir.as_ref());
+    let working_dir = parent_dir.unwrap_or_else(|| script_dir.as_ref());
 
     app_handle
         .shell()
         .command(shell_type)
         .current_dir(working_dir)
-        .args(&[script_path])
+        .args([script_path.as_str()])
         .output()
         .await?;
 
     Ok(())
+}
+
+async fn handle_copy(src: &PathBuf, dest: &PathBuf, file: &str) {
+    match fs::copy(src, dest).await {
+        Ok(_) => {
+            logging!(debug, Type::Setup, "resources copied '{}'", file);
+        }
+        Err(err) => {
+            logging!(
+                error,
+                Type::Setup,
+                "failed to copy resources '{}' to '{:?}', {}",
+                file,
+                dest,
+                err
+            );
+        }
+    };
 }
